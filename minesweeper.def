@@ -1,0 +1,5 @@
+LIBRARY minesweeper
+EXPORTS
+    launch_minesweeper_kernel @1
+    launch_merged_minesweeper_kernel @2
+    launch_super_merged_minesweeper_kernel @3
