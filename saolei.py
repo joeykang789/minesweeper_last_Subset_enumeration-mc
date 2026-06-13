@@ -32,10 +32,15 @@ def cmd_sweep(args):
     # 解析密度参数
     rho = args.rho
     if "-" in rho:
-        parts = rho.split("-")
-        lo = float(parts[0])
-        hi = float(parts[1])
-        step = float(parts[2]) if len(parts) > 2 else 0.01
+        lo_str, rest = rho.split("-", 1)
+        lo = float(lo_str)
+        if ":" in rest:
+            hi_str, step_str = rest.split(":", 1)
+            hi = float(hi_str)
+            step = float(step_str)
+        else:
+            hi = float(rest)
+            step = 0.01
         densities = []
         d = lo
         while d <= hi + 1e-9:
@@ -143,7 +148,7 @@ def cmd_web(args):
     port = args.port
     server_script = PROJECT_DIR / "web" / "server.py"
     os.chdir(str(PROJECT_DIR))
-    os.system(f'"{sys.executable}" "{server_script}" {port}')
+    subprocess.run([sys.executable, str(server_script), str(port)])
 
 
 def cmd_results(args):
@@ -167,11 +172,11 @@ def cmd_results(args):
                 "ci95": float(row["ci95"]) * 100,
             })
 
-    print(f"{'棋盘':>8} {'密度数':>6} {'临界ρ':>8} {'ρ50%':>8} {'ρ85%':>8}")
-    print("-" * 45)
+    print(f"{'棋盘':>10} {'总格':>5} {'密度数':>6} {'临界ρ':>8} {'ρ50%':>8} {'ρ85%':>8}")
+    print("-" * 50)
     for size in sorted(data.keys()):
-        d = sorted(data[size])
-        rho_crit = next((den for den, w, _ in [(x["density"], x["win_rate"], x["ci95"]) for x in d] if w < 5), 0)
+        d = sorted(data[size], key=lambda x: x["density"])
+        rho_crit = next((x["density"] for x in d if x["win_rate"] < 5), 0)
         rho_50 = 0
         for i in range(1, len(d)):
             if d[i-1]["win_rate"] >= 50 and d[i]["win_rate"] < 50:
