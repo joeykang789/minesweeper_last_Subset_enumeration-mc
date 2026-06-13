@@ -18,7 +18,13 @@ quick_compare.py
 simple_test.py
 large_scale_test.py
 
-# Old experiment results
+# One-off analysis/plot scripts (not in final repo)
+benchmark_*.py
+plot_*.py
+scaling_*.py
+analyze_*.py
+generate_*.py
+run_2*.py
 cuda_results_*/
 fig_*.png
 sweep_20x20.png
