@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>扫雷AI - CUDA GPU 实验平台</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,system-ui,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;background:#f0f2f5;color:#333;line-height:1.6}
+.container{max-width:1200px;margin:0 auto;padding:20px}
+.header{background:linear-gradient(135deg,#1a237e,#283593);color:#fff;padding:24px 32px;border-radius:12px;margin-bottom:24px}
+.header h1{font-size:24px;font-weight:700}
+.header p{font-size:14px;opacity:.85;margin-top:4px}
+.panel{background:#fff;border-radius:10px;padding:24px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.panel h2{font-size:16px;font-weight:600;margin-bottom:16px;color:#1a237e}
+.row{display:flex;gap:16px;flex-wrap:wrap}
+.col{flex:1;min-width:140px}
+label{display:block;font-size:13px;font-weight:500;color:#555;margin-bottom:4px}
+input,select{width:100%;padding:8px 12px;border:1px solid #d9d9d9;border-radius:6px;font-size:14px;transition:border-color .2s}
+input:focus,select:focus{border-color:#1a237e;outline:none;box-shadow:0 0 0 2px rgba(26,35,126,.1)}
+.btn{padding:10px 24px;border:none;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:#1a237e;color:#fff}
+.btn-primary:hover{background:#283593}
+.btn-primary:disabled{background:#9fa8da;cursor:not-allowed}
+.btn-danger{background:#d32f2f;color:#fff}
+.btn-danger:hover{background:#b71c1c}
+.btn-success{background:#2e7d32;color:#fff}
+.btn-success:hover{background:#1b5e20}
+.btn-outline{background:transparent;color:#1a237e;border:1px solid #1a237e}
+.btn-outline:hover{background:#e8eaf6}
+.btn-group{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+.status-bar{display:flex;gap:24px;flex-wrap:wrap;padding:12px 16px;background:#f5f5f5;border-radius:8px;margin-top:12px;font-size:13px}
+.status-item span{font-weight:600}
+.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:8px}
+.progress-fill{height:100%;background:linear-gradient(90deg,#1a237e,#5c6bc0);transition:width .5s;border-radius:4px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:2px solid #e0e0e0}
+.tab{padding:10px 20px;cursor:pointer;border:none;background:none;font-size:14px;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s}
+.tab.active{color:#1a237e;border-bottom-color:#1a237e;font-weight:600}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.output-box{background:#263238;color:#e0e0e0;padding:16px;border-radius:8px;font-family:"Cascadia Code","Fira Code","Consolas",monospace;font-size:13px;line-height:1.5;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.result-card{background:#f5f5f5;border-radius:8px;padding:16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
+.result-card .stat{text-align:center;min-width:80px;padding:8px}
+.result-card .stat .val{font-size:20px;font-weight:700;color:#1a237e}
+.result-card .stat .lbl{font-size:11px;color:#888}
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;margin-top:16px}
+.chart-grid img{width:100%;border-radius:8px;border:1px solid #e0e0e0}
+.empty-state{text-align:center;padding:48px;color:#999}
+.empty-state .icon{font-size:48px;margin-bottom:12px}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:500}
+.badge-running{background:#fff3e0;color:#e65100}
+.badge-done{background:#e8f5e9;color:#2e7d32}
+.badge-error{background:#ffebee;color:#c62828}
+.badge-stopped{background:#eceff1;color:#546e7a}
+@media(max-width:768px){.row{flex-direction:column}.col{min-width:100%}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+  <h1>扫雷AI · CUDA GPU 实验平台</h1>
+  <p>子集枚举 + 蒙特卡洛(MC)求解器 · 支持断点重续</p>
+</div>
+
+<!-- 配置面板 -->
+<div class="panel">
+  <h2>实验配置</h2>
+  <div class="row">
+    <div class="col">
+      <label>棋盘大小</label>
+      <input id="board" value="20x20" placeholder="20x20 / 20-50 / 20,25,30">
+      <small style="color:#999;font-size:11px">支持: 20x20 / 20-50(范围) / 20,25,30(列表)</small>
+    </div>
+    <div class="col">
+      <label>密度范围 (ρ)</label>
+      <input id="rho" value="0.10-0.35:0.01" placeholder="0.10-0.35:0.01">
+      <small style="color:#999;font-size:11px">格式: 起始-结束:步长</small>
+    </div>
+    <div class="col">
+      <label>每配置局数</label>
+      <input id="trials" type="number" value="200" min="10" step="10">
+    </div>
+    <div class="col">
+      <label>随机种子</label>
+      <input id="seed" type="number" value="2026">
+    </div>
+  </div>
+  <div class="btn-group">
+    <button class="btn btn-primary" onclick="runSweep()">▶ 开始扫描</button>
+    <button class="btn btn-outline" onclick="quickPlay()">▶ 快速测试 (20x20×1000局)</button>
+    <button class="btn btn-success" onclick="document.getElementById('resumeInput').click()">↻ 断点重续</button>
+    <input id="resumeInput" type="file" accept=".csv" style="display:none" onchange="resumeFromFile(this)">
+  </div>
+</div>
+
+<!-- 状态面板 -->
+<div class="panel" id="statusPanel" style="display:none">
+  <h2>运行状态</h2>
+  <div class="status-bar">
+    <div class="status-item">状态: <span id="statusText" class="badge badge-running">等待中</span></div>
+    <div class="status-item">进度: <span id="progressText">0%</span></div>
+    <div class="status-item">局数: <span id="gamesText">0/0</span></div>
+    <div class="status-item">配置: <span id="cfgsText">0/0</span></div>
+    <div class="status-item">当前: <span id="currentText">-</span></div>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+  <div class="btn-group">
+    <button class="btn btn-danger" id="stopBtn" onclick="stopTask()">■ 停止</button>
+  </div>
+  <div style="margin-top:12px">
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('output',this)">运行日志</div>
+      <div class="tab" onclick="switchTab('results',this)">实验结果</div>
+    </div>
+    <div class="tab-content active" id="tab-output">
+      <div class="output-box" id="outputBox">等待运行...</div>
+    </div>
+    <div class="tab-content" id="tab-results">
+      <div id="resultsContainer"><div class="empty-state"><div class="icon">📊</div><p>运行完成后在此显示结果</p></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- 历史结果 -->
+<div class="panel">
+  <h2>已保存结果</h2>
+  <div id="historyContainer"><div class="empty-state"><div class="icon">📁</div><p>暂无历史结果</p></div></div>
+</div>
+</div>
+
+<script>
+const BASE = '';
+let currentTaskId = null;
+let pollInterval = null;
+let csvContent = '';
+
+// 开始实验
+async function runSweep() {
+  const board = document.getElementById('board').value.trim();
+  const rho = document.getElementById('rho').value.trim();
+  const trials = parseInt(document.getElementById('trials').value);
+  const seed = parseInt(document.getElementById('seed').value);
+  await launchTask({ board, rho, trials, seed });
+}
+
+async function quickPlay() {
+  await launchTask({ board: '20x20', rho: '0.20', trials: 1000, seed: 2026 });
+}
+
+async function resumeFromFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  csvContent = await file.text();
+  const board = document.getElementById('board').value.trim();
+  const rho = document.getElementById('rho').value.trim();
+  const trials = parseInt(document.getElementById('trials').value);
+  const seed = parseInt(document.getElementById('seed').value);
+  await launchTask({ board, rho, trials, seed, resume_csv: true, csv_content: csvContent });
+}
+
+async function launchTask(params) {
+  document.getElementById('statusPanel').style.display = 'block';
+  document.getElementById('outputBox').textContent = '启动中...';
+  document.getElementById('resultsContainer').innerHTML = '<div class="empty-state"><div class="icon">⏳</div><p>等待结果...</p></div>';
+  document.getElementById('stopBtn').disabled = false;
+  setStatus('running', '启动中');
+
+  try {
+    const resp = await fetch(BASE + '/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params)
+    });
+    const data = await resp.json();
+    if (data.error) { setStatus('error', data.error); return; }
+    currentTaskId = data.task_id;
+    startPolling(data.task_id);
+  } catch(e) {
+    setStatus('error', '连接失败: ' + e.message);
+  }
+}
+
+// 轮询状态
+function startPolling(taskId) {
+  if (pollInterval) clearInterval(pollInterval);
+  pollInterval = setInterval(async () => {
+    try {
+      const resp = await fetch(BASE + '/status/' + taskId);
+      const data = await resp.json();
+      if (data.error) { setStatus('error', data.error); stopPolling(); return; }
+      updateUI(data);
+      if (['done','error','stopped'].includes(data.status)) {
+        stopPolling();
+        if (data.result) showResults(data.result);
+      }
+    } catch(e) {
+      // ignore
+    }
+  }, 500);
+}
+
+function stopPolling() {
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
+// 停止任务
+async function stopTask() {
+  if (!currentTaskId) return;
+  document.getElementById('stopBtn').disabled = true;
+  try {
+    await fetch(BASE + '/stop/' + currentTaskId, { method: 'POST' });
+  } catch(e) {}
+}
+
+// 更新UI
+function updateUI(data) {
+  const s = data.status;
+  setStatus(s, s === 'done' ? '完成' : s === 'error' ? '错误' : s === 'stopped' ? '已停止' : '运行中');
+
+  if (data.progress) {
+    const p = data.progress;
+    document.getElementById('progressText').textContent = (p.pct || 0).toFixed(1) + '%';
+    document.getElementById('progressFill').style.width = (p.pct || 0) + '%';
+    document.getElementById('gamesText').textContent = (p.done_games || 0) + '/' + (p.total_games || 0);
+    document.getElementById('cfgsText').textContent = (p.done_cfgs || 0) + '/' + (p.total_cfgs || 0);
+    document.getElementById('currentText').textContent = (p.current_ar || '') + ' ' + (p.current_cells || '') + ' ' + (p.current_density || '');
+  }
+
+  const out = document.getElementById('outputBox');
+  if (data.output && data.output.length > 0) {
+    out.textContent = data.output.join('\n');
+    out.scrollTop = out.scrollHeight;
+  }
+}
+
+function setStatus(status, text) {
+  const el = document.getElementById('statusText');
+  el.textContent = text;
+  el.className = 'badge badge-' + status;
+}
+
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+}
+
+function showResults(result) {
+  const container = document.getElementById('resultsContainer');
+  let html = '<div style="margin-bottom:12px"><strong>结果目录:</strong> ' + (result.dir || '-') + '</div>';
+
+  if (result.charts && result.charts.length > 0) {
+    html += '<div class="chart-grid">';
+    result.charts.forEach(chart => {
+      const relPath = chart.replace(/\\/g, '/');
+      html += '<div><img src="/results/' + relPath + '" loading="lazy"></div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="empty-state"><div class="icon">📊</div><p>无图表</p></div>';
+  }
+
+  container.innerHTML = html;
+}
+
+// 加载历史结果
+async function loadHistory() {
+  try {
+    const resp = await fetch(BASE + '/list-results');
+    const data = await resp.json();
+    const container = document.getElementById('historyContainer');
+    if (!data.results || data.results.length === 0) {
+      container.innerHTML = '<div class="empty-state"><div class="icon">📁</div><p>暂无历史结果</p></div>';
+      return;
+    }
+    let html = '';
+    data.results.forEach(r => {
+      const name = r.name || r.dir;
+      html += '<div class="result-card">';
+      html += '<div><strong>' + name + '</strong></div>';
+      html += '<div class="btn-group" style="margin:0">';
+      html += '<button class="btn btn-outline" style="padding:4px 12px;font-size:12px" onclick="viewResult(\'' + r.dir.replace(/\\/g,'/') + '\')">查看</button>';
+      if (r.params) html += '<button class="btn btn-outline" style="padding:4px 12px;font-size:12px" onclick="resumeFromDir(\'' + r.dir.replace(/\\/g,'/') + '\',\'' + (r.csv||'') + '\')">续传</button>';
+      html += '</div></div>';
+    });
+    container.innerHTML = html;
+  } catch(e) {}
+}
+
+async function viewResult(dir) {
+  const container = document.getElementById('resultsContainer');
+  document.getElementById('statusPanel').style.display = 'block';
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.tab:nth-child(2)').classList.add('active');
+  document.getElementById('tab-output').classList.remove('active');
+  document.getElementById('tab-results').classList.add('active');
+
+  // Try to find CSV and plots
+  try {
+    const resp = await fetch(BASE+'/list-results');
+    const data = await resp.json();
+    const result = data.results.find(r => r.dir === dir);
+    if (result) showResults({ dir, charts: result.charts || [], csv: result.csv });
+  } catch(e) {}
+}
+
+async function resumeFromDir(dir, csv) {
+  if (!csv) return;
+  try {
+    const resp = await fetch(csv);
+    csvContent = await resp.text();
+    const board = document.getElementById('board').value.trim();
+    const rho = document.getElementById('rho').value.trim();
+    const trials = parseInt(document.getElementById('trials').value);
+    const seed = parseInt(document.getElementById('seed').value);
+    await launchTask({ board, rho, trials, seed, resume_csv: true, csv_content: csvContent });
+  } catch(e) {
+    setStatus('error', '加载CSV失败: ' + e.message);
+  }
+}
+
+// 初始化
+loadHistory();
+</script>
+</body>
+</html>

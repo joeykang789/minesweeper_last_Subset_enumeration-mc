@@ -29,6 +29,7 @@ cuda_results_*/
 fig_*.png
 sweep_20x20.png
 *.html
+!web/*.html
 *.txt
 scaling_analysis_report.txt
 

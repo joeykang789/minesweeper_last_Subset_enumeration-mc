@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = BASE_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
-SCRIPT = BASE_DIR / "run_cuda_experiments.py"
+SAOLEI_SCRIPT = BASE_DIR / "saolei.py"
 WEB_DIR = BASE_DIR / "web"
 
 tasks: dict[str, dict] = {}
@@ -103,15 +103,28 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/list-results":
             results = []
             if RESULTS_DIR.is_dir():
+                # List CSV files directly in results dir
+                for f in sorted(RESULTS_DIR.glob("*.csv")):
+                    results.append({
+                        "dir": str(f.parent),
+                        "name": f.stem,
+                        "csv": str(f),
+                        "charts": sorted(str(p) for p in RESULTS_DIR.glob("*.png")),
+                    })
+                # Also list subdirectories
                 for d in sorted(RESULTS_DIR.iterdir()):
                     if d.is_dir():
                         csv_file = d / "experiment_data.csv"
+                        if not csv_file.exists():
+                            csv_files = list(d.glob("*.csv"))
+                            csv_file = csv_files[0] if csv_files else None
                         json_file = d / "experiment_params.json"
                         results.append({
                             "dir": str(d),
                             "name": d.name,
-                            "csv": str(csv_file) if csv_file.exists() else None,
+                            "csv": str(csv_file) if csv_file and csv_file.exists() else None,
                             "params": str(json_file) if json_file.exists() else None,
+                            "charts": sorted(str(p) for p in d.glob("*.png")),
                         })
             self._json({"results": results})
             return
@@ -143,29 +156,38 @@ class Handler(SimpleHTTPRequestHandler):
     def _run_task(self, task_id: str, params: dict):
         info = tasks[task_id]
         try:
-            timestamp = "--timestamp" if params.get("timestamp", True) else ""
-            args = [
-                sys.executable, "-u", str(SCRIPT),
-                "--aspect-ratios", params.get("aspect_ratios", "1.0"),
-                "--min-cells", str(params.get("min_cells", 16)),
-                "--max-cells", str(params.get("max_cells", 256)),
-                "--cell-step", str(params.get("cell_step", 24)),
-                "--min-density", str(params.get("min_density", 0.10)),
-                "--max-density", str(params.get("max_density", 0.35)),
-                "--density-step", str(params.get("density_step", 0.05)),
-                "--trials", str(params.get("trials", 100)),
-                "--seed", str(params.get("seed", 2026)),
-                "--output-dir", str(RESULTS_DIR),
-            ]
-            if not params.get("interactive", True):
-                args.append("--no-interactive")
-            if timestamp:
-                args.append("--timestamp")
-            if params.get("vram_monitor"):
-                args.append("--vram-monitor")
-            resume_csv = params.get("csv_path") or params.get("resume_csv")
-            if resume_csv and os.path.exists(resume_csv):
-                args.extend(["--resume", resume_csv])
+            board = params.get("board", "20x20")
+            rho = params.get("rho", "0.10-0.35:0.01")
+            trials = params.get("trials", 200)
+            seed = params.get("seed", 2026)
+            output_csv = RESULTS_DIR / f"sweep_{uuid.uuid4().hex[:8]}.csv"
+
+            # Handle resume CSV (file upload)
+            resume_csv = params.get("resume_csv")
+            csv_content = params.get("csv_content")
+            if resume_csv and csv_content:
+                resume_path = RESULTS_DIR / "resume_temp.csv"
+                with open(resume_path, "w", encoding="utf-8") as f:
+                    f.write(csv_content)
+                output_csv = resume_path  # reuse same file
+                args = [
+                    sys.executable, "-u", str(SAOLEI_SCRIPT), "sweep",
+                    "--board", board,
+                    "--rho", rho,
+                    "--trials", str(trials),
+                    "--seed", str(seed),
+                    "--output", str(output_csv),
+                    "--resume",
+                ]
+            else:
+                args = [
+                    sys.executable, "-u", str(SAOLEI_SCRIPT), "sweep",
+                    "--board", board,
+                    "--rho", rho,
+                    "--trials", str(trials),
+                    "--seed", str(seed),
+                    "--output", str(output_csv),
+                ]
 
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
@@ -185,17 +207,12 @@ class Handler(SimpleHTTPRequestHandler):
                 if info["status"] == "paused":
                     while info["status"] == "paused":
                         time.sleep(0.5)
-                if line.startswith("PROGRESS|"):
-                    try:
-                        parts = line.split("|")
-                        for part in parts[1:]:
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                info["progress"][k] = v
-                    except Exception:
-                        pass
-                else:
-                    info["output"].append(line)
+                info["output"].append(line)
+                # Parse progress from output lines like "20x20: 26 densities x 200 games = 5200 games"
+                if "x" in line and "games" in line:
+                    info["progress"]["current_cells"] = line.split(":")[0].strip()
+                if "局/秒" in line:
+                    pass
 
             proc.wait()
             if info["status"] in ("stopped", "stopping"):
@@ -204,8 +221,9 @@ class Handler(SimpleHTTPRequestHandler):
             info["status"] = "done" if proc.returncode == 0 else "error"
 
             if proc.returncode == 0:
-                results = self._find_results(RESULTS_DIR)
-                info["result"] = results
+                # Find results: look for the output CSV and any PNGs
+                result = self._find_single_result(output_csv)
+                info["result"] = result
             else:
                 info["output"].append(f"进程退出码: {proc.returncode}")
 
@@ -214,27 +232,22 @@ class Handler(SimpleHTTPRequestHandler):
                 info["status"] = "error"
                 info["output"].append(f"错误: {e}")
 
-    def _find_results(self, base: Path) -> dict | None:
-        if not base.is_dir():
+    def _find_single_result(self, csv_path: Path) -> dict | None:
+        if not csv_path or not csv_path.exists():
             return None
-        dirs = sorted([p for p in base.iterdir() if p.is_dir()])
-        for d in reversed(dirs):
-            pngs = list(d.glob("*.png")) + list(d.glob("*.html"))
-            if pngs:
-                csv_file = d / "experiment_data.csv"
-                return {
-                    "dir": str(d),
-                    "csv": str(csv_file) if csv_file.exists() else None,
-                    "charts": sorted(str(f) for f in pngs),
-                }
-        pngs = list(base.glob("*.png")) + list(base.glob("*.html"))
-        csv_file = base / "experiment_data.csv"
-        if not pngs and not csv_file.exists():
-            return None
+        # Look for plots in the plots directory
+        plots_dir = csv_path.parent / csv_path.stem.replace("sweep_", "plots_")
+        plots = list(plots_dir.glob("*.png")) if plots_dir.exists() else []
+        if not plots:
+            # Also check sweep_20x50_plots/ or similar
+            for p in [BASE_DIR / "sweep_20x50_plots"]:
+                if p.exists():
+                    plots = list(p.glob("*.png"))
+                    break
         return {
-            "dir": str(base),
-            "csv": str(csv_file) if csv_file.exists() else None,
-            "charts": sorted(str(f) for f in pngs),
+            "dir": str(csv_path.parent),
+            "csv": str(csv_path),
+            "charts": sorted(str(f) for f in plots),
         }
 
     def _json(self, data: dict, code: int = 200):
