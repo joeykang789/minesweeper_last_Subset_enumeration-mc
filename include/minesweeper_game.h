@@ -183,13 +183,18 @@ __device__ __forceinline__ int infer_all_sh_iterative(int rows, int cols,
         }
 
         if (!changed) {
-            int num_c = 0;
-            int ch[128 * 8];
-            int chc[128];
-            int crm[128];
+            // For large boards, skip expensive subset enumeration (O(N²))
+            // MC handles probability estimation much better for large boards
+            int total_cells = rows * cols;
+            if (total_cells > 400) continue;
 
-            for (int rr = 0; rr < rows && num_c < 128; rr++) {
-                for (int cc = 0; cc < cols && num_c < 128; cc++) {
+            int num_c = 0;
+            int* ch = out_safe + total_cells;      // reuse out_safe tail for temp arrays
+            int* chc = ch + 512 * 8;
+            int* crm = chc + 512;
+
+            for (int rr = 0; rr < rows && num_c < 512; rr++) {
+                for (int cc = 0; cc < cols && num_c < 512; cc++) {
                     int idx = rr * cols + cc;
                     if (!revealed[idx]) continue;
                     int n = 0, fc = 0, hc = 0;
@@ -259,12 +264,439 @@ __device__ __forceinline__ int infer_all_sh_iterative(int rows, int cols,
     return (mine_count << 16) | (safe_count & 0xFFFF);
 }
 
+__device__ __forceinline__ int monte_carlo_infer(
+    int rows, int cols,
+    const int* revealed, const int* flagged, const int* mine_cells,
+    int total_mines,
+    int* work_buf, int* mine_buf, uint32_t* seen,
+    uint32_t seed, int step
+) {
+    int total = rows * cols;
+    int total_words = (total + 31) / 32;
+
+    // Phase 1: collect all unknown cells into work_buf[0..unk_count)
+    int unk_count = 0;
+    int flagged_count = 0;
+    for (int i = 0; i < total; i++) {
+        if (flagged[i]) flagged_count++;
+        else if (!revealed[i]) work_buf[unk_count++] = i;
+    }
+    int remaining_mines = total_mines - flagged_count;
+    if (unk_count == 0 || remaining_mines <= 0) return -1;
+
+    // Phase 2: build border constraints (use work_buf + 2*total onward)
+    int* perm = work_buf + total;          // temp shuffle buffer
+    int* cons_cells = work_buf + 2 * total;
+    int max_cons = (total * 2) / 10;
+    int* cons_hc = cons_cells + max_cons * 8;
+    int* cons_rem = cons_hc + max_cons;
+
+    int num_cons = 0;
+    for (int r = 0; r < rows && num_cons < max_cons; r++) {
+        for (int c = 0; c < cols && num_cons < max_cons; c++) {
+            int idx = r * cols + c;
+            if (!revealed[idx]) continue;
+            int n = 0, fc = 0, hc = 0;
+            int hlist[8];
+            for (int k = 0; k < 8; k++) {
+                int nr = r + dr[k], nc = c + dc[k];
+                if (!in_bounds(nr, nc, rows, cols)) continue;
+                int ni = nr * cols + nc;
+                n += mine_cells[ni];
+                if (flagged[ni]) fc++;
+                else if (!revealed[ni]) { hlist[hc++] = ni; }
+            }
+            if (hc == 0) continue;
+            int rem = n - fc;
+            if (rem < 0 || rem > hc) continue;
+            cons_hc[num_cons] = hc;
+            cons_rem[num_cons] = rem;
+            for (int k = 0; k < hc; k++)
+                cons_cells[num_cons * 8 + k] = hlist[k];
+            num_cons++;
+        }
+    }
+
+    // Phase 3: separate frontier vs interior cells
+    // First pass: count frontier cells (does NOT modify work_buf yet)
+    int frontier_count = 0;
+    int first_interior_cell = -1;
+    for (int i = 0; i < unk_count; i++) {
+        int cell = work_buf[i];
+        int r = cell / cols, c = cell % cols;
+        int adj_revealed = 0;
+        for (int k = 0; k < 8 && !adj_revealed; k++) {
+            int nr = r + dr[k], nc = c + dc[k];
+            if (in_bounds(nr, nc, rows, cols) && revealed[nr * cols + nc])
+                adj_revealed = 1;
+        }
+        if (adj_revealed) {
+            frontier_count++;
+        } else if (first_interior_cell < 0) {
+            first_interior_cell = cell;
+        }
+    }
+    int interior_count = unk_count - frontier_count;
+
+    // Adaptive sample count
+    int num_samples = (total > 1000) ? 50 : (total > 400) ? 100 : 200;
+
+    int valid_count = 0;
+    for (int i = 0; i < total; i++) mine_buf[i] = 0;
+
+    uint32_t mc_ctr = 1000000 + (uint32_t)step * 50000;
+    int to_select = remaining_mines < unk_count ? remaining_mines : unk_count;
+
+    // Decide which MC path to take
+    int use_frontier_only = (frontier_count >= 50 && frontier_count < unk_count);
+
+    if (frontier_count == 0) {
+        // all cells are interior — uniform probability, pick any
+        return (interior_count > 0) ? first_interior_cell : -1;
+    }
+
+    if (!use_frontier_only) {
+        // Full MC path: work_buf[0..unk_count) still has all unknown cells (not compacted)
+        for (int s = 0; s < num_samples; s++) {
+            for (int i = 0; i < unk_count; i++) perm[i] = work_buf[i];
+            for (int i = 0; i < to_select; i++) {
+                int range = unk_count - i;
+                uint32_t j = philox_rand(seed, mc_ctr, range);
+                mc_ctr += 8;
+                int tmp = perm[i]; perm[i] = perm[i + j]; perm[i + j] = tmp;
+            }
+
+            for (int w = 0; w < total_words; w++) seen[w] = 0;
+            for (int i = 0; i < to_select; i++) {
+                int cell = perm[i];
+                seen[cell >> 5] |= (1u << (cell & 31));
+            }
+
+            int valid = 1;
+            for (int ci = 0; ci < num_cons && valid; ci++) {
+                int cnt = 0;
+                for (int k = 0; k < cons_hc[ci]; k++) {
+                    int cell = cons_cells[ci * 8 + k];
+                    cnt += (seen[cell >> 5] >> (cell & 31)) & 1;
+                }
+                if (cnt != cons_rem[ci]) valid = 0;
+            }
+
+            if (valid) {
+                valid_count++;
+                for (int i = 0; i < to_select; i++)
+                    mine_buf[perm[i]]++;
+            }
+        }
+    } else {
+        // Frontier-only path: compact frontier cells to work_buf[0..frontier_count)
+        int write_idx = 0;
+        for (int i = 0; i < unk_count; i++) {
+            int cell = work_buf[i];
+            int r = cell / cols, c = cell % cols;
+            int adj_revealed = 0;
+            for (int k = 0; k < 8 && !adj_revealed; k++) {
+                int nr = r + dr[k], nc = c + dc[k];
+                if (in_bounds(nr, nc, rows, cols) && revealed[nr * cols + nc])
+                    adj_revealed = 1;
+            }
+            if (adj_revealed) work_buf[write_idx++] = cell;
+        }
+
+        int expected_k = (frontier_count * remaining_mines + unk_count / 2) / unk_count;
+        int min_k = max(0, remaining_mines - interior_count);
+        int max_k = min(remaining_mines, frontier_count);
+        if (expected_k < min_k) expected_k = min_k;
+        if (expected_k > max_k) expected_k = max_k;
+        if (expected_k > frontier_count) expected_k = frontier_count;
+
+        for (int s = 0; s < num_samples; s++) {
+            // copy frontier list to perm, shuffle in-place
+            for (int i = 0; i < frontier_count; i++) perm[i] = work_buf[i];
+            for (int i = 0; i < expected_k; i++) {
+                int range = frontier_count - i;
+                uint32_t j = philox_rand(seed, mc_ctr, range);
+                mc_ctr += 8;
+                int tmp = perm[i]; perm[i] = perm[i + j]; perm[i + j] = tmp;
+            }
+
+            for (int w = 0; w < total_words; w++) seen[w] = 0;
+            for (int i = 0; i < expected_k; i++) {
+                int cell = perm[i];
+                seen[cell >> 5] |= (1u << (cell & 31));
+            }
+
+            int valid = 1;
+            for (int ci = 0; ci < num_cons && valid; ci++) {
+                int cnt = 0;
+                for (int k = 0; k < cons_hc[ci]; k++) {
+                    int cell = cons_cells[ci * 8 + k];
+                    cnt += (seen[cell >> 5] >> (cell & 31)) & 1;
+                }
+                if (cnt != cons_rem[ci]) valid = 0;
+            }
+
+            if (valid) {
+                valid_count++;
+                for (int i = 0; i < expected_k; i++)
+                    mine_buf[perm[i]]++;
+            }
+        }
+    }
+
+    // Phase 4: find best cell (lowest mine probability)
+    int best = -1;
+    float min_p = 1.0f;
+    if (valid_count > 0) {
+        for (int i = 0; i < frontier_count; i++) {
+            int cell = work_buf[i];
+            float p = (float)mine_buf[cell] / (float)valid_count;
+            if (p < min_p) { min_p = p; best = cell; }
+        }
+
+        // interior cells: uniform background probability
+        float bg_p = (float)remaining_mines / (float)unk_count;
+        if (bg_p < min_p && first_interior_cell >= 0) {
+            best = first_interior_cell;
+        }
+    }
+
+    return best;
+}
+
+__device__ __forceinline__ int mcmc_infer(
+    int rows, int cols,
+    const int* revealed, const int* flagged, const int* mine_cells,
+    int total_mines,
+    int* work_buf, int* mine_buf, uint32_t* seen,
+    uint32_t seed, int step
+) {
+    int total = rows * cols;
+
+    // Step 1: collect unknown cells and count flagged
+    int unk_count = 0;
+    int flagged_count = 0;
+    for (int i = 0; i < total; i++) {
+        if (flagged[i]) flagged_count++;
+        else if (!revealed[i]) work_buf[unk_count++] = i;
+    }
+    int remaining_mines = total_mines - flagged_count;
+    if (unk_count == 0 || remaining_mines <= 0) return -1;
+    int to_select = remaining_mines < unk_count ? remaining_mines : unk_count;
+
+    // Step 2: build border constraints (same as MC)
+    int num_cons = 0;
+    int cons_cells[512 * 8];
+    int cons_hc[512];
+    int cons_rem[512];
+
+    for (int r = 0; r < rows && num_cons < 512; r++) {
+        for (int c = 0; c < cols && num_cons < 512; c++) {
+            int idx = r * cols + c;
+            if (!revealed[idx]) continue;
+            int n = 0, fc = 0, hc = 0;
+            int hlist[8];
+            for (int k = 0; k < 8; k++) {
+                int nr = r + dr[k], nc = c + dc[k];
+                if (!in_bounds(nr, nc, rows, cols)) continue;
+                int ni = nr * cols + nc;
+                n += mine_cells[ni];
+                if (flagged[ni]) fc++;
+                else if (!revealed[ni]) hlist[hc++] = ni;
+            }
+            if (hc == 0) continue;
+            int rem = n - fc;
+            if (rem < 0 || rem > hc) continue;
+            cons_hc[num_cons] = hc;
+            cons_rem[num_cons] = rem;
+            for (int k = 0; k < hc; k++)
+                cons_cells[num_cons * 8 + k] = hlist[k];
+            num_cons++;
+        }
+    }
+
+    // Step 3: build cell-to-constraint mapping
+    int cell_cons_cnt[MAX_BOARD_CELLS];
+    int cell_cons[MAX_BOARD_CELLS * 8];
+    for (int i = 0; i < total; i++) cell_cons_cnt[i] = 0;
+
+    for (int ci = 0; ci < num_cons; ci++) {
+        for (int k = 0; k < cons_hc[ci]; k++) {
+            int cell = cons_cells[ci * 8 + k];
+            cell_cons[cell * 8 + cell_cons_cnt[cell]] = ci;
+            cell_cons_cnt[cell]++;
+        }
+    }
+
+    // Step 4: find initial valid config via rejection sampling (up to 200 attempts)
+    int perm[MAX_BOARD_CELLS];
+    uint32_t mc_ctr = 1000000 + (uint32_t)step * 50000;
+
+    int is_mine[MAX_BOARD_CELLS];
+    int mine_list[MAX_BOARD_CELLS];
+    int free_list[MAX_BOARD_CELLS];
+    int num_mines = 0, num_free = 0;
+
+    int found = 0;
+    for (int attempt = 0; attempt < 200; attempt++) {
+        for (int i = 0; i < unk_count; i++) perm[i] = work_buf[i];
+        for (int i = 0; i < to_select; i++) {
+            int range = unk_count - i;
+            uint32_t j = philox_rand(seed, mc_ctr, range);
+            mc_ctr += 8;
+            int tmp = perm[i]; perm[i] = perm[i + j]; perm[i + j] = tmp;
+        }
+
+        for (int i = 0; i < total; i++) is_mine[i] = 0;
+        for (int i = 0; i < to_select; i++) is_mine[perm[i]] = 1;
+
+        int valid = 1;
+        for (int ci = 0; ci < num_cons && valid; ci++) {
+            int cnt = 0;
+            for (int k = 0; k < cons_hc[ci]; k++) {
+                int cell = cons_cells[ci * 8 + k];
+                cnt += is_mine[cell];
+            }
+            if (cnt != cons_rem[ci]) valid = 0;
+        }
+
+        if (valid) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return -1;
+
+    num_mines = 0; num_free = 0;
+    for (int i = 0; i < unk_count; i++) {
+        int cell = work_buf[i];
+        if (is_mine[cell]) mine_list[num_mines++] = cell;
+        else free_list[num_free++] = cell;
+    }
+
+    uint32_t chain_ctr = mc_ctr + 100000;
+
+    // Step 5: burn-in — 100 swap perturbations (no recording)
+    for (int s = 0; s < 100; s++) {
+        uint32_t mi = philox_rand(seed, chain_ctr, num_mines);
+        chain_ctr += 8;
+        int mc = mine_list[mi];
+
+        uint32_t fi = philox_rand(seed, chain_ctr, num_free);
+        chain_ctr += 8;
+        int fc_cell = free_list[fi];
+
+        // propose swap
+        is_mine[mc] = 0;
+        is_mine[fc_cell] = 1;
+
+        // collect affected constraints (union of both cells' constraints)
+        int affected[16], aff_cnt = 0;
+        for (int k = 0; k < cell_cons_cnt[mc]; k++) {
+            int ci = cell_cons[mc * 8 + k];
+            int dup = 0;
+            for (int a = 0; a < aff_cnt; a++) if (affected[a] == ci) { dup = 1; break; }
+            if (!dup) affected[aff_cnt++] = ci;
+        }
+        for (int k = 0; k < cell_cons_cnt[fc_cell]; k++) {
+            int ci = cell_cons[fc_cell * 8 + k];
+            int dup = 0;
+            for (int a = 0; a < aff_cnt; a++) if (affected[a] == ci) { dup = 1; break; }
+            if (!dup) affected[aff_cnt++] = ci;
+        }
+
+        int valid = 1;
+        for (int a = 0; a < aff_cnt && valid; a++) {
+            int ci = affected[a];
+            int cnt = 0;
+            for (int k = 0; k < cons_hc[ci]; k++) {
+                int cell = cons_cells[ci * 8 + k];
+                cnt += is_mine[cell];
+            }
+            if (cnt != cons_rem[ci]) valid = 0;
+        }
+
+        if (valid) {
+            mine_list[mi] = fc_cell;
+            free_list[fi] = mc;
+        } else {
+            is_mine[mc] = 1;
+            is_mine[fc_cell] = 0;
+        }
+    }
+
+    // Step 6: sampling — 200 swap perturbations (record mine counts after each)
+    int hit_count[MAX_BOARD_CELLS];
+    for (int i = 0; i < total; i++) hit_count[i] = 0;
+
+    for (int s = 0; s < 200; s++) {
+        uint32_t mi = philox_rand(seed, chain_ctr, num_mines);
+        chain_ctr += 8;
+        int mc = mine_list[mi];
+
+        uint32_t fi = philox_rand(seed, chain_ctr, num_free);
+        chain_ctr += 8;
+        int fc_cell = free_list[fi];
+
+        is_mine[mc] = 0;
+        is_mine[fc_cell] = 1;
+
+        int affected[16], aff_cnt = 0;
+        for (int k = 0; k < cell_cons_cnt[mc]; k++) {
+            int ci = cell_cons[mc * 8 + k];
+            int dup = 0;
+            for (int a = 0; a < aff_cnt; a++) if (affected[a] == ci) { dup = 1; break; }
+            if (!dup) affected[aff_cnt++] = ci;
+        }
+        for (int k = 0; k < cell_cons_cnt[fc_cell]; k++) {
+            int ci = cell_cons[fc_cell * 8 + k];
+            int dup = 0;
+            for (int a = 0; a < aff_cnt; a++) if (affected[a] == ci) { dup = 1; break; }
+            if (!dup) affected[aff_cnt++] = ci;
+        }
+
+        int valid = 1;
+        for (int a = 0; a < aff_cnt && valid; a++) {
+            int ci = affected[a];
+            int cnt = 0;
+            for (int k = 0; k < cons_hc[ci]; k++) {
+                int cell = cons_cells[ci * 8 + k];
+                cnt += is_mine[cell];
+            }
+            if (cnt != cons_rem[ci]) valid = 0;
+        }
+
+        if (valid) {
+            mine_list[mi] = fc_cell;
+            free_list[fi] = mc;
+        } else {
+            is_mine[mc] = 1;
+            is_mine[fc_cell] = 0;
+        }
+
+        for (int i = 0; i < num_mines; i++)
+            hit_count[mine_list[i]]++;
+    }
+
+    // Step 7: pick cell with lowest mine probability
+    int best = -1;
+    float min_p = 1.0f;
+    for (int i = 0; i < unk_count; i++) {
+        int cell = work_buf[i];
+        float p = (float)hit_count[cell] / 200.0f;
+        if (p < min_p) { min_p = p; best = cell; }
+    }
+    return best;
+}
+
 __device__ __forceinline__ int ai_choose_sh(int rows, int cols,
                                               int* revealed, int* flagged,
                                               const int* mine_cells,
+                                              int total_mines,
                                               int* work_buf, int* mine_buf,
                                               int* out_cell,
-                                              uint32_t* seen) {
+                                              uint32_t* seen,
+                                              uint32_t seed, int step) {
     int result = infer_all_sh_iterative(rows, cols, revealed, flagged, mine_cells,
                                         work_buf, mine_buf, seen);
     int mine_count = result >> 16;
@@ -278,6 +710,13 @@ __device__ __forceinline__ int ai_choose_sh(int rows, int cols,
     for (int i = 0; i < safe_count; i++) {
         int si = work_buf[i];
         if (!revealed[si]) { *out_cell = si; return 1; }
+    }
+
+    int mc_best = monte_carlo_infer(rows, cols, revealed, flagged, mine_cells,
+                                     total_mines, work_buf, mine_buf, seen, seed, step);
+    if (mc_best >= 0) {
+        *out_cell = mc_best;
+        return 1;
     }
 
     int total = rows * cols;
@@ -362,7 +801,8 @@ __device__ __forceinline__ int run_one_game_sh(int rows, int cols, int mines, in
     while (!done && steps < limit) {
         int target = -1;
         int action = ai_choose_sh(rows, cols, w_revealed, w_flagged, w_mines,
-                                   w_inf, w_all, &target, w_seen);
+                                   mines, w_inf, w_all, &target, w_seen,
+                                   seed, steps);
         if (target < 0 || target >= total) break;
 
         if (action == 0) {

@@ -113,10 +113,12 @@ __global__ void minesweuper_super_merged_kernel(
 
     int cell_offset = config_cell_offsets[cfg_idx] + total * game_in_cfg;
 
+    int inf_offset = cell_offset * 4;
+
     int s, f;
     int won = run_one_game_sh(rows, cols, mines, seed,
                                w_revealed + cell_offset, w_flagged + cell_offset, w_mines + cell_offset,
-                               w_qr + cell_offset, w_qc + cell_offset, w_all + cell_offset, w_inf + cell_offset,
+                               w_qr + cell_offset, w_qc + cell_offset, w_all + cell_offset, w_inf + inf_offset,
                                w_seen + (cell_offset >> 5),
                                &s, &f);
 

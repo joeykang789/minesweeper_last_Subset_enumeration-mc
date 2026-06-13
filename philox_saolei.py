@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-import random
+import random as _random
 from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
@@ -223,6 +223,216 @@ class PhiloxHeuristicEngine:
             return max(0.0, min(1.0, total_sum / cnt))
         return 0.5
 
+    def monte_carlo_choose(self) -> Optional[Tuple[str, Action, str]]:
+        env = self.env
+        total = env.rows * env.cols
+        unknown = [(r, c) for r in range(env.rows) for c in range(env.cols)
+                   if not env.revealed[r][c] and not env.flagged[r][c]]
+        if not unknown:
+            return None
+        flagged_count = sum(env.flagged[r][c] for r in range(env.rows) for c in range(env.cols))
+        remaining = env.mines - flagged_count
+        if remaining <= 0:
+            return None
+
+        drs = [-1, -1, -1, 0, 0, 1, 1, 1]
+        dcs = [-1, 0, 1, -1, 1, -1, 0, 1]
+
+        constraints = []
+        for r in range(env.rows):
+            for c in range(env.cols):
+                if not env.revealed[r][c]:
+                    continue
+                hlist, fc = [], 0
+                for k in range(8):
+                    nr, nc = r + drs[k], c + dcs[k]
+                    if not env.in_bounds(nr, nc):
+                        continue
+                    if env.flagged[nr][nc]:
+                        fc += 1
+                    elif not env.revealed[nr][nc]:
+                        hlist.append((nr, nc))
+                if not hlist:
+                    continue
+                rem = env.adjacent_mines(r, c) - fc
+                if rem < 0 or rem > len(hlist):
+                    continue
+                constraints.append((hlist, rem))
+
+        num_samples = 200
+        valid_count = 0
+        hit = {cell: 0 for cell in unknown}
+        to_select = min(remaining, len(unknown))
+
+        for _ in range(num_samples):
+            perm = unknown[:]
+            for i in range(to_select):
+                j = i + _random.randrange(len(unknown) - i)
+                perm[i], perm[j] = perm[j], perm[i]
+            mine_set = set(perm[:to_select])
+
+            valid = True
+            for hlist, rem in constraints:
+                cnt = sum(1 for cell in hlist if cell in mine_set)
+                if cnt != rem:
+                    valid = False
+                    break
+
+            if valid:
+                valid_count += 1
+                for cell in perm[:to_select]:
+                    hit[cell] += 1
+
+        if valid_count == 0:
+            return None
+
+        best, min_p = None, 1.0
+        for cell in unknown:
+            p = hit[cell] / valid_count
+            if p < min_p:
+                min_p = p
+                best = cell
+
+        if best is None:
+            return None
+        return "reveal", best, f"蒙特卡洛: {best} 概率 {min_p:.3f} ({valid_count}/{num_samples} 有效样本)"
+
+    def mcmc_choose(self) -> Optional[Tuple[str, Action, str]]:
+        """MCMC: Markov Chain Monte Carlo with swap-based perturbation"""
+        env = self.env
+        total = env.rows * env.cols
+        unknown = [(r, c) for r in range(env.rows) for c in range(env.cols)
+                   if not env.revealed[r][c] and not env.flagged[r][c]]
+        if not unknown:
+            return None
+        flagged_count = sum(env.flagged[r][c] for r in range(env.rows) for c in range(env.cols))
+        remaining = env.mines - flagged_count
+        if remaining <= 0:
+            return None
+        to_select = min(remaining, len(unknown))
+
+        drs = [-1, -1, -1, 0, 0, 1, 1, 1]
+        dcs = [-1, 0, 1, -1, 1, -1, 0, 1]
+
+        # Build constraints
+        constraints = []  # each is (list_of_cells, rem)
+        for r in range(env.rows):
+            for c in range(env.cols):
+                if not env.revealed[r][c]:
+                    continue
+                hlist, fc = [], 0
+                for k in range(8):
+                    nr, nc = r + drs[k], c + dcs[k]
+                    if not env.in_bounds(nr, nc):
+                        continue
+                    if env.flagged[nr][nc]:
+                        fc += 1
+                    elif not env.revealed[nr][nc]:
+                        hlist.append((nr, nc))
+                if not hlist:
+                    continue
+                rem = env.adjacent_mines(r, c) - fc
+                if rem < 0 or rem > len(hlist):
+                    continue
+                constraints.append((hlist, rem))
+
+        # Cell-to-constraint mapping
+        cell_cons = {cell: [] for cell in unknown}
+        for ci, (hlist, _) in enumerate(constraints):
+            for cell in hlist:
+                cell_cons[cell].append(ci)
+
+        # Find initial valid config via rejection sampling (up to 200 attempts)
+        is_mine = {cell: False for cell in unknown}
+        found = False
+        for _ in range(200):
+            perm = unknown[:]
+            for i in range(to_select):
+                j = i + _random.randrange(len(unknown) - i)
+                perm[i], perm[j] = perm[j], perm[i]
+            mine_set = set(perm[:to_select])
+            valid = True
+            for hlist, rem in constraints:
+                cnt = sum(1 for cell in hlist if cell in mine_set)
+                if cnt != rem:
+                    valid = False
+                    break
+            if valid:
+                for cell in mine_set:
+                    is_mine[cell] = True
+                found = True
+                break
+        if not found:
+            return None
+
+        mine_list = [c for c in unknown if is_mine[c]]
+        free_list = [c for c in unknown if not is_mine[c]]
+        num_mines = len(mine_list)
+
+        # Burn-in: 100 swap perturbations (no recording)
+        for _ in range(100):
+            mi = _random.randrange(num_mines)
+            fi = _random.randrange(len(free_list))
+            mc, fc_cell = mine_list[mi], free_list[fi]
+
+            is_mine[mc] = False
+            is_mine[fc_cell] = True
+
+            affected = set(cell_cons[mc]) | set(cell_cons[fc_cell])
+            valid = True
+            for ci in affected:
+                hlist, rem = constraints[ci]
+                cnt = sum(1 for cell in hlist if is_mine[cell])
+                if cnt != rem:
+                    valid = False
+                    break
+
+            if valid:
+                mine_list[mi] = fc_cell
+                free_list[fi] = mc
+            else:
+                is_mine[mc] = True
+                is_mine[fc_cell] = False
+
+        # Sampling: 200 swap perturbations (record mine counts)
+        hit = {cell: 0 for cell in unknown}
+        for _ in range(200):
+            mi = _random.randrange(num_mines)
+            fi = _random.randrange(len(free_list))
+            mc, fc_cell = mine_list[mi], free_list[fi]
+
+            is_mine[mc] = False
+            is_mine[fc_cell] = True
+
+            affected = set(cell_cons[mc]) | set(cell_cons[fc_cell])
+            valid = True
+            for ci in affected:
+                hlist, rem = constraints[ci]
+                cnt = sum(1 for cell in hlist if is_mine[cell])
+                if cnt != rem:
+                    valid = False
+                    break
+
+            if valid:
+                mine_list[mi] = fc_cell
+                free_list[fi] = mc
+            else:
+                is_mine[mc] = True
+                is_mine[fc_cell] = False
+
+            for cell in mine_list:
+                hit[cell] += 1
+
+        best, min_p = None, 1.0
+        for cell in unknown:
+            p = hit[cell] / 200.0
+            if p < min_p:
+                min_p, best = p, cell
+
+        if best is None:
+            return None
+        return "reveal", best, f"MCMC: {best} 概率 {min_p:.3f} ({200} MCMC 样本)"
+
     def choose(self) -> Tuple[str, Action, str]:
         """
         选择下一步行动
@@ -230,18 +440,18 @@ class PhiloxHeuristicEngine:
         """
         safe, mines, reasons = self.infer_safe_and_mines()
 
-        # 首先标记地雷
         for cell in mines:
             if not self.env.flagged[cell[0]][cell[1]]:
                 return "flag", cell, reasons[-1] if reasons else f"{cell} 被推断为雷"
 
-        # 然后翻开安全格子
         for cell in safe:
             if not self.env.revealed[cell[0]][cell[1]]:
                 return "reveal", cell, reasons[-1] if reasons else f"{cell} 被推断为安全"
 
-        # 收集边界候选格子（与 CUDA ai_choose_sh 一致）
-        # 边界候选 = 已揭示格子的邻居中的隐藏格子
+        mc_result = self.monte_carlo_choose()
+        if mc_result is not None:
+            return mc_result
+
         candidates = []
         seen = set()
         for r in range(self.env.rows):
@@ -256,13 +466,11 @@ class PhiloxHeuristicEngine:
                         candidates.append((nr, nc))
 
         if not candidates:
-            # 没有边界候选时，使用所有 legal_actions
             candidates = [cell for cell in self.env.legal_actions()
                          if not self.env.flagged[cell[0]][cell[1]]]
         if not candidates:
             return "reveal", self.env.rng.choice(self.env.legal_actions()), "没有可继续推理的未插旗格子"
 
-        # 估计每个候选格子的概率，选择最低的
         best = None
         min_prob = 1.0
         for cell in candidates:

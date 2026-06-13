@@ -88,7 +88,7 @@ class GPUMemoryPool:
         self.total_threads = total_threads
         self.max_cells = max_cells
         self.int_work_size = total_threads * max_cells * 4
-        self.inf_work_size = total_threads * max_cells * 4
+        self.inf_work_size = total_threads * max_cells * 4 * 4
         self.seen_work_size = total_threads * ((max_cells + 31) // 32) * 4
         self.results_size = total_threads * 4
         self._allocated = []

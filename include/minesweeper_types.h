@@ -4,7 +4,7 @@
 // Maximum board dimensions
 // Reduced to 256 to minimize register usage and prevent spilling
 // Boards > 256 cells are not supported in the small kernel path
-#define MAX_BOARD_CELLS 256
+#define MAX_BOARD_CELLS 2500
 #define MAX_BOARD_DIM   64
 #define MAX_NEIGHBORS   8
 
